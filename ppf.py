@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
+EMMA modified this to make it FASTER!
+
 This script computes the point-pair features of a given
 model and tries to find the model in a given scene.
+
+source: https://github.com/whateverforever/model-globally-match-locally-python/blob/master/ppf.py 
 
 Note: Currently, trimesh doesn't support pointcloud with normals. To combat this, you need to
       reconstruct some surface between the points (e.g. ball pivoting)
@@ -22,50 +26,52 @@ from scipy.spatial import KDTree
 from scipy.spatial.distance import pdist
 from scipy.cluster.hierarchy import linkage, fcluster
 
+#EMMA
+import numpy as np
+from numba import njit
 
-def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("model", help="Path to the model pointcloud")
-    parser.add_argument("scene", help="Path to the scene pointcloud")
-    parser.add_argument(
-        "--fast", action="store_true", help="Use the c++ extension for speeeeeed"
-    )
-    parser.add_argument(
-        "--scene-pts-fraction",
-        default=0.2,
-        type=float,
-        help="Fraction of scene points to use as reference",
-    )
-    parser.add_argument(
-        "--ppf-num-angles",
-        default=30,
-        type=int,
-        help="Number of angle steps used to discretize feature angles.",
-    )
-    parser.add_argument(
-        "--ppf-rel-dist-step",
-        default=0.05,
-        type=float,
-        help="Discretization step of feature distances, relative to model diameter.",
-    )
-    parser.add_argument(
-        "--alpha-num-angles",
-        default=30,
-        type=int,
-        help="Number of angle steps used to discretize the rotation angle alpha.",
-    )
-    parser.add_argument(
-        "--cluster-max-angle",
-        type=float,
-        default=30,
-        help="Maximal angle between poses after which they don't belong to same cluster anymore. [degrees]",
-    )
-    args = parser.parse_args()
+@njit(fastmath=True)
+def vote_numba(
+    m_pairs, model_alphas_array, alpha_s, inv_alpha_step, num_angles, accumulator
+):
+    n_pairs = m_pairs.shape[0]
+
+    for i in range(n_pairs):
+        mA = m_pairs[i, 0]
+        mB = m_pairs[i, 1]
+
+        alpha_m = model_alphas_array[mA, mB]
+
+        if alpha_m != -999.0:
+            diff = alpha_m - alpha_s
+            alpha_disc = int(diff * inv_alpha_step) % num_angles
+
+            if alpha_disc < 0:
+                alpha_disc += num_angles
+
+            idx = mA * num_angles + alpha_disc
+            accumulator[idx] += 1
+
+
+def get_poses(model_path, scene_path, scene_pts_fraction=0.5, ppf_rel_dist_step=0.05):
+    class Args:
+        pass
+    
+    args = Args()
+    args.model = model_path
+    args.scene = scene_path
+    args.fast = True
+    args.scene_pts_fraction = scene_pts_fraction
+    args.ppf_num_angles = 30#24 #30
+    args.ppf_rel_dist_step = ppf_rel_dist_step
+    args.alpha_num_angles = 30#24 #30 #EMMA!
+    args.cluster_max_angle = 20 #30 #EMMA!
+
+    _compute_ppf = compute_ppf
+    _pdist_rot = pdist_rot
 
     if args.fast:
-        import ppf_fast
+        import ppf_fast #this has to be builded first!
 
         _compute_ppf = ppf_fast.compute_ppf
         _pdist_rot = ppf_fast.pdist_rot
@@ -116,11 +122,11 @@ def main():
         [150, 200, 150, 240] for _ in _scene_vis.vertices
     ]
 
-    plt.figure()
-    plt.show()
+    # plt.figure()
+    # plt.show()
 
-    vis = trimesh.Scene([_model_vis, _scene_vis])
-    vis.show()
+    # vis = trimesh.Scene([_model_vis, _scene_vis])
+    # vis.show()
 
     ## 1. compute ppfs of all vertex pairs in model, store in hash table
     angle_step = float(np.radians(360 / args.ppf_num_angles))
@@ -128,96 +134,356 @@ def main():
 
     print("Computing model ppfs features")
     t_start = time.perf_counter()
-    ppfs_model, _, model_alphas = _compute_ppf(
-        to_nanobind(model.vertices),
-        to_nanobind(model.vertex_normals),
-        angle_step,
-        dist_step,
-    )
+    if args.fast:
+        ppfs_model, _, model_alphas = _compute_ppf(
+            to_nanobind(model.vertices),
+            to_nanobind(model.vertex_normals),
+            angle_step,
+            dist_step
+        )
+    else:
+        ppfs_model, _, model_alphas = _compute_ppf(
+            to_nanobind(model.vertices),
+            to_nanobind(model.vertex_normals),
+            angle_step,
+            dist_step,
+            alphas=True
+        )
     t_end = time.perf_counter()
     print(f"Computing ppfs for {len(model.vertices)} verts took {t_end - t_start:.2f}s")
 
     ## 2. choose reference points in scene, compute their ppfs
     t_start = time.perf_counter()
-    _, pairs_scene, scene_alphas = _compute_ppf(
-        to_nanobind(scene.vertices),
-        to_nanobind(scene.vertex_normals),
-        angle_step,
-        dist_step,
-        max_dist=modelscale,
-        ref_fraction=args.scene_pts_fraction,
-    )
+    if args.fast:
+        _, pairs_scene, scene_alphas = _compute_ppf(
+            to_nanobind(scene.vertices),
+            to_nanobind(scene.vertex_normals),
+            angle_step,
+            dist_step,
+            max_dist=modelscale,
+            ref_fraction=args.scene_pts_fraction
+        )
+    else:
+        _, pairs_scene, scene_alphas = _compute_ppf(
+            to_nanobind(scene.vertices),
+            to_nanobind(scene.vertex_normals),
+            angle_step,
+            dist_step,
+            max_dist=modelscale,
+            ref_fraction=args.scene_pts_fraction,
+            alphas=True
+        )
     t_end = time.perf_counter()
     print(f"Computing all scene ppfs took {t_end - t_start:.1f}s")
 
     ## 3. go through scene ppfs, look up in table if we find model ppf
+    t_start = time.perf_counter()
     skipped_features = 0
 
     # discretization for the alpha rotation
     alpha_step = np.radians(360 / args.alpha_num_angles)
 
-    poses = []
-    # accumulator we're going to reuse for each reference vert
-    accumulator = np.zeros((len(model.vertices), args.alpha_num_angles))
+    #++++++++++++++++++++++++++++++++++++++++++++++
+    if args.fast:
+        print("Running fast C++ matching & voting...")
+        num_s_verts = len(scene.vertices)
+        scene_alphas_array = np.full((num_s_verts, num_s_verts), -999.0, dtype=np.float32)
+        for (sA_idx, sB_idx), val in scene_alphas.items():
+            scene_alphas_array[sA_idx, sB_idx] = val
 
-    print("Num reference verts", len(pairs_scene))
-    for idx_ref, sA in enumerate(pairs_scene):
-        print(
-            f"{idx_ref+1}/{len(pairs_scene)}: {len(pairs_scene[sA])} paired verts for ref {sA}",
-            " " * 20,
-            end="\r",
+        num_m_verts = len(model.vertices)
+        model_alphas_array = np.full((num_m_verts, num_m_verts), -999.0, dtype=np.float32)
+        for (mA_idx, mB_idx), val in model_alphas.items():
+            model_alphas_array[mA_idx, mB_idx] = val
+
+        alpha_step = float(np.radians(360 / args.alpha_num_angles))
+
+        peaks = ppf_fast.match_and_vote(
+            ppfs_model,
+            pairs_scene,
+            scene_alphas_array,
+            model_alphas_array,
+            num_m_verts,
+            num_s_verts,
+            args.alpha_num_angles,
+            alpha_step
         )
 
-        # one accumulator per reference vert, we set it to zero instead of re-initializing
-        accumulator[...] = 0
+        poses = []
+        unit_x = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        # for peak in peaks:
+        for sA, best_mr, best_alpha, score in peaks:
+            s_r = scene.vertices[sA]
+            s_normal = scene.vertex_normals[sA]
+            # sA = peak.sA
+            # best_mr = peak.best_mr
+            # best_alpha = peak.best_alpha
+            # score = peak.votes
 
-        for sB in pairs_scene[sA]:
-            if sA == sB:
-                continue
+            s_r = scene.vertices[sA]
+            s_normal = scene.vertex_normals[sA]
+            m_normal = model.vertex_normals[best_mr]
+            
+            R_scene2glob = np.eye(4)
+            R_scene2glob[:3, :3] = align_vectors(s_normal, unit_x) # Reines NumPy!
+            T_scene2glob = R_scene2glob @ tf.translation_matrix(-s_r)
 
-            s_feature = pairs_scene[sA][sB]
-            if s_feature not in ppfs_model:
-                skipped_features += 1
-                continue
-
-            alpha_s = scene_alphas[(sA, sB)]
-
-            for m_pair in ppfs_model[s_feature]:
-                mA, mB = m_pair
-                alpha_m = model_alphas[m_pair]
-                alpha = alpha_m - alpha_s
-
-                alpha_disc = int(alpha // alpha_step)
-                accumulator[mA, alpha_disc] += 1
-                # accumulator[mA, (alpha_disc - 1) % args.alpha_num_angles] += 1
-                # accumulator[mA, (alpha_disc + 1) % args.alpha_num_angles] += 1
-
-        peak_cutoff = np.max(accumulator) * 0.9
-        idxs_peaks = np.argwhere(accumulator > peak_cutoff)
-
-        s_r = scene.vertices[sA]
-        s_normal = scene.vertex_normals[sA]
-
-        R_scene2glob = np.eye(4)
-        R_scene2glob[:3, :3] = align_vectors(s_normal, [1, 0, 0])
-        T_scene2glob = R_scene2glob @ tf.translation_matrix(-s_r)
-
-        for best_mr, best_alpha in idxs_peaks:
+            # Modell -> Global Transformation
             R_model2glob = np.eye(4)
-            R_model2glob[:3, :3] = align_vectors(
-                model.vertex_normals[best_mr], [1, 0, 0]
-            )
-            T_model2glob = R_model2glob @ tf.translation_matrix(
-                -model.vertices[best_mr]
-            )
+            R_model2glob[:3, :3] = align_vectors(m_normal, unit_x) # Reines NumPy!
+            T_model2glob = R_model2glob @ tf.translation_matrix(-model.vertices[best_mr])
 
             R_alpha = tf.rotation_matrix(alpha_step * best_alpha, [1, 0, 0], [0, 0, 0])
-            # TODO: invert homog
             T_model2scene = np.linalg.inv(T_scene2glob) @ R_alpha @ T_model2glob
-            poses.append((T_model2scene, best_mr, accumulator[best_mr, best_alpha]))
+            
+            poses.append((T_model2scene, best_mr, score))
 
-    print(f"Got {len(poses)} poses after matching", " " * 20)
+        t_end = time.perf_counter()
+        print(f"Matching & voting completed in {t_end - t_start:.2f}s (found {len(poses)} peak candidates)")
+    #++++++++++++++++++++++++++++++++++++++++++++++
+
+    else:
+
+        inv_alpha_step = 1.0 / alpha_step #Emma
+
+        poses = []
+        # accumulator we're going to reuse for each reference vert
+        #accumulator = np.zeros((len(model.vertices), args.alpha_num_angles)) # Emma
+
+        # ---- EMMA
+        num_m_verts = len(model.vertices)
+        num_angles = args.alpha_num_angles
+
+        # Flaches 1D-Array im C-Speicher-Layout (float32 ist schneller als float64)
+        accumulator = np.zeros(num_m_verts * num_angles, dtype=np.float32)
+
+        # ---- EMMA
+        num_s_verts = len(scene.vertices)
+        scene_alphas_array = np.full((num_s_verts, num_s_verts), -999.0, dtype=np.float32)
+        for (sA_idx, sB_idx), val in scene_alphas.items():
+            scene_alphas_array[sA_idx, sB_idx] = val
+
+        num_m_verts = len(model.vertices)
+        model_alphas_array = np.full((num_m_verts, num_m_verts), -999.0, dtype=np.float32)
+
+        for (mA_idx, mB_idx), val in model_alphas.items():
+            model_alphas_array[mA_idx, mB_idx] = val
+
+        t_inner_loop = 0.0      # Vorbereitung, Dict-Lookups, Alpha-Mathe, Accumulator Voting
+        t_peaks = 0.0           # np.max und np.argwhere auf dem Accumulator
+        t_scene_trans = 0.0     # Scene-Transformationen (s_normal, R_scene2glob, T_scene2glob)
+        t_pose_calc = 0.0       # Innere Peaks-Schleife (Model-Normale, R_alpha, Matrix-Invertierung)
+
+        t_sub_lookup_feat = 0.0   # 1. Feature Lookups & Scene-Pairs
+        t_sub_lookup_scene = 0.0  # 2. scene_alphas_array Lookup
+        t_sub_lookup_model = 0.0  # 3. Model-Pairs & Try-Except
+        t_sub_accumulator = 0.0   # 4. Alpha-Berechnung & Accumulator += 1
+
+        t_loop_total_start = time.perf_counter()
+        # ---- EMMA
+
+        print("Num reference verts", len(pairs_scene))
+        for idx_ref, sA in enumerate(pairs_scene):
+            print(
+                f"{idx_ref+1}/{len(pairs_scene)}: {len(pairs_scene[sA])} paired verts for ref {sA}",
+                " " * 20,
+                end="\r",
+            )
+
+            # ---- Emma
+            t0 = time.perf_counter()
+
+            # one accumulator per reference vert, we set it to zero instead of re-initializing
+            #accumulator[...] = 0
+            accumulator.fill(0) #Emma
+
+            for sB in pairs_scene[sA]:
+                ts0 = time.perf_counter()
+
+                if sA == sB:
+                    continue
+
+                s_feature = pairs_scene[sA][sB]
+                if s_feature not in ppfs_model:
+                    skipped_features += 1
+                    continue
+
+                ts1 = time.perf_counter()
+                t_sub_lookup_feat += (ts1 - ts0)
+
+                #alpha_s = scene_alphas[(sA, sB)] #EMMA
+                #alpha_s = scene_alphas.get((sA, sB))
+                # if alpha_s is None:
+                #     print("CONTINUE ALPHA")
+                #     continue
+                # try:
+                #     alpha_s = scene_alphas[(sA, sB)]
+                # except KeyError:
+                #     continue
+                alpha_s = scene_alphas_array[sA, sB]
+                if alpha_s == -999.0:
+                    continue
+
+                ts2 = time.perf_counter()
+                t_sub_lookup_scene += (ts2 - ts1)
+
+                m_pairs = ppfs_model[s_feature]  # Sollte ein np.ndarray mit Shape (N, 2) sein
+                if len(m_pairs) > 0:
+                    ts3 = time.perf_counter()
+                    m_pairs_arr = np.asarray(m_pairs)
+                    vote_numba(
+                        m_pairs_arr,
+                        model_alphas_array,
+                        alpha_s,
+                        inv_alpha_step,
+                        num_angles,
+                        accumulator,
+                    )
+
+                    ts5 = time.perf_counter()
+                    t_sub_lookup_model += ts5 - ts3
+                    continue #use numba EMMA
+                    mAs = m_pairs_arr[:, 0]
+                    mBs = m_pairs_arr[:, 1]
+
+                    # Alle Alphas auf einmal aus dem Array lesen
+                    alpha_ms = model_alphas_array[mAs, mBs]
+
+                    # Filtern, wo alpha_m gültig ist
+                    valid_mask = alpha_ms != -999.0
+                    if np.any(valid_mask):
+                        valid_mAs = mAs[valid_mask]
+                        valid_alpha_ms = alpha_ms[valid_mask]
+
+                        ts4 = time.perf_counter()
+                        t_sub_lookup_model += (ts4 - ts3)
+
+                        # Vektorisierte Alpha-Mathe
+                        alpha_discs = (
+                            (valid_alpha_ms - alpha_s) * inv_alpha_step
+                        ).astype(np.int32) % args.alpha_num_angles
+
+                        # Akkumulator auf einen Schlag in C befüllen!
+                        flat_indices = valid_mAs * args.alpha_num_angles + alpha_discs
+                        np.add.at(accumulator, flat_indices, 1)
+                        #np.add.at(accumulator, (valid_mAs, alpha_discs), 1)
+
+                        ts5 = time.perf_counter()
+                        t_sub_accumulator += (ts5 - ts4)
+
+                # for m_pair in ppfs_model[s_feature]:
+                #     ts3 = time.perf_counter()
+                #     mA, mB = m_pair
+                #     #alpha_m = model_alphas[m_pair] # EMMA
+                #     # alpha_m = model_alphas.get(m_pair)
+                #     # if alpha_m is None:
+                #     #     print("CONTINUE ALPHA_M")
+                #     #     continue
+                #     # try:
+                #     #     alpha_m = model_alphas[m_pair]
+                #     # except KeyError:
+                #     #     continue
+                #     alpha_m = model_alphas_array[mA, mB]
+                #     if alpha_m == -999.0:
+                #         continue
+                #     #alpha = alpha_m - alpha_s #Emma
+
+                #     ts4 = time.perf_counter()
+                #     t_sub_lookup_model += (ts4 - ts3)
+
+                #     # alpha_disc = int(alpha // alpha_step) Emma
+                #     alpha_disc = int((alpha_m - alpha_s) * inv_alpha_step) % args.alpha_num_angles
+                #     #accumulator[mA, alpha_disc] += 1
+                #     accumulator[mA * num_angles + alpha_disc] += 1
+                #     # accumulator[mA, (alpha_disc - 1) % args.alpha_num_angles] += 1
+                #     # accumulator[mA, (alpha_disc + 1) % args.alpha_num_angles] += 1
+
+                #     ts5 = time.perf_counter()
+                #     t_sub_accumulator += (ts5 - ts4)
+            
+            # ---- Emma
+            t1 = time.perf_counter()
+            t_inner_loop += (t1 - t0)
+
+            peak_cutoff = np.max(accumulator) * 0.9
+            if peak_cutoff > 0:
+                #idxs_peaks = np.argwhere(accumulator > peak_cutoff)
+                idxs_1d = np.argwhere(accumulator > peak_cutoff).flatten()
+        
+                # 1D-Indices wieder in (best_mr, best_alpha) umrechnen:
+                idxs_peaks = [(idx // num_angles, idx % num_angles) for idx in idxs_1d]
+            else:
+                print("SKIPPING REF VERT", sA, "NO PEAKS")
+                idxs_peaks = []
+
+            if len(idxs_peaks) == 0: #EMMA
+                print("SKIPPING REF VERT", sA, "NO PEAKS")
+                continue
+
+            # ---- Emma
+            t2 = time.perf_counter()
+            t_peaks += (t2 - t1)
+
+            s_r = scene.vertices[sA]
+            s_normal = scene.vertex_normals[sA]
+
+            R_scene2glob = np.eye(4)
+            R_scene2glob[:3, :3] = align_vectors(s_normal, [1, 0, 0])
+            T_scene2glob = R_scene2glob @ tf.translation_matrix(-s_r)
+
+            # ---- Emma
+            t3 = time.perf_counter()
+            t_scene_trans += (t3 - t2)
+
+            for best_mr, best_alpha in idxs_peaks:
+                R_model2glob = np.eye(4)
+                R_model2glob[:3, :3] = align_vectors(
+                    model.vertex_normals[best_mr], [1, 0, 0]
+                )
+                T_model2glob = R_model2glob @ tf.translation_matrix(
+                    -model.vertices[best_mr]
+                )
+
+                R_alpha = tf.rotation_matrix(alpha_step * best_alpha, [1, 0, 0], [0, 0, 0])
+                # TODO: invert homog
+                T_model2scene = np.linalg.inv(T_scene2glob) @ R_alpha @ T_model2glob
+                #poses.append((T_model2scene, best_mr, accumulator[best_mr, best_alpha]))
+                poses.append((T_model2scene, best_mr, accumulator[best_mr * args.alpha_num_angles + best_alpha]))
+
+            # --- Emma
+            t4 = time.perf_counter()
+            t_pose_calc += (t4 - t3)
+
+        t_loop_total = time.perf_counter() - t_loop_total_start
+        print()
+
+        # ----------------------------------------------------
+        # PROFILING AUSGABE / STATISTIK
+        # ----------------------------------------------------
+        print("\n" + "="*50)
+        print("PROFILING STATISTIK FOR MATCHING LOOP")
+        print("="*50)
+        print(f"Gesamtdauer der Schleife: {t_loop_total:.2f} Sekunden\n")
+
+        print(f"1. Inner Loop (Voting/Matching) : {t_inner_loop:6.2f}s | {t_inner_loop/t_loop_total*100:5.1f}%")
+        print("   ├── 1a. Feature-Lookups (s_feature) : {:6.2f}s | {:5.1f}%".format(t_sub_lookup_feat, t_sub_lookup_feat/t_loop_total*100))
+        print("   ├── 1b. Scene-Alpha Array Lookup   : {:6.2f}s | {:5.1f}%".format(t_sub_lookup_scene, t_sub_lookup_scene/t_loop_total*100))
+        print("   ├── 1c. Model-Alpha Lookups        : {:6.2f}s | {:5.1f}%".format(t_sub_lookup_model, t_sub_lookup_model/t_loop_total*100))
+        #print("   └── 1d. Alpha-Mathe & Accumulator  : {:6.2f}s | {:5.1f}%".format(t_sub_accumulator, t_sub_accumulator/t_loop_total*100))
+        print(f"2. Peak Detection (Numpy Max/Where): {t_peaks:6.2f}s | {t_peaks/t_loop_total*100:5.1f}%")
+        print(f"3. Scene Transformation           : {t_scene_trans:6.2f}s | {t_scene_trans/t_loop_total*100:5.1f}%")
+        print(f"4. Pose Reconstruction (Peaks)    : {t_pose_calc:6.2f}s | {t_pose_calc/t_loop_total*100:5.1f}%")
+        print("="*50 + "\n")
+        # ----------------------------------------------------
+
+    print(f"Got {len(poses)} poses after matching", "+" * 20)
     print("Skipped", skipped_features, "scene pairs, not found in model")
+    t_end = time.perf_counter()
+    print(f"Searching ppf pairs took {t_end - t_start:.1f}s")
+
+    if not poses or len(poses) == 0:
+        print("CRITICAL: Keine Posen gefunden. Matching gescheitert.")
+        return []
 
     t_cluster_start = time.perf_counter()
     pose_clusters = cluster_poses(
@@ -230,22 +496,23 @@ def main():
     t_cluster_end = time.perf_counter()
     print(f"Clustering took {t_cluster_end - t_cluster_start:.1f}s")
 
-    ## Visualize result
-    scene_refs = trimesh.PointCloud(
-        [scene.vertices[idx] for idx in list(pairs_scene.keys())]
-    )
-    vis = trimesh.Scene([_scene_vis, scene_refs])
-    for T_model2scene, m_r, score in poses:
-        model_vis = _model_vis.copy()
-        color = (*np.random.randint(0, 255, size=3), 255)
-        model_vis.visual.vertex_colors = [color for _ in model_vis.vertices]
-        model_vis.apply_transform(T_model2scene)
-        vis.add_geometry(model_vis)
+    # ## Visualize result
+    # scene_refs = trimesh.PointCloud(
+    #     [scene.vertices[idx] for idx in list(pairs_scene.keys())]
+    # )
+    # vis = trimesh.Scene([_scene_vis, scene_refs])
+    # for T_model2scene, m_r, score in poses:
+    #     model_vis = _model_vis.copy()
+    #     color = (*np.random.randint(0, 255, size=3), 255)
+    #     model_vis.visual.vertex_colors = [color for _ in model_vis.vertices]
+    #     model_vis.apply_transform(T_model2scene)
+    #     vis.add_geometry(model_vis)
 
-        print("Score", score)
-        print(np.around(T_model2scene, decimals=2))
-        print()
-    vis.show()
+    #     print("Score", score)
+    #     print(np.around(T_model2scene, decimals=2))
+    #     print()
+    # vis.show()
+    return poses
 
 
 def to_nanobind(arr):
@@ -253,7 +520,8 @@ def to_nanobind(arr):
     Workaround for current bug in nanobind: arrays need to be writable to be recognized
     https://github.com/wjakob/nanobind/issues/42
     """
-    F_arr = np.asfortranarray(arr)
+    arr_copy = np.copy(arr)
+    F_arr = np.asfortranarray(arr_copy)
     F_arr.setflags(write=True)
     return F_arr
 
@@ -336,6 +604,7 @@ def compute_ppf(
 
     num_pts = int(ref_fraction * len(vertices))
     num_pts = min(num_pts, ref_abs or len(vertices))
+    random.seed(42) #EMMA, same seed for study purpose
     idxsA = random.sample(idxs, k=num_pts)
     print(f"Going for {num_pts} reference pts ({num_pts/len(vertices) * 100:.0f}%)")
 
@@ -402,7 +671,11 @@ def rotation_between(rotmatA, rotmatB):
 
     r_oa_t = np.transpose(rotmatA)
     r_ab = r_oa_t @ rotmatB
-    return np.arccos((np.trace(r_ab) - 1) / 2)
+    #EMMA
+    cos_theta = (np.trace(r_ab) - 1) / 2
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+
+    return np.arccos(cos_theta)
 
 
 matA = tf.rotation_matrix(np.pi / 4, [1, 0, 0])[:3, :3]
@@ -471,9 +744,9 @@ def cluster_poses(poses, dist_max=0.5, rot_max_deg=10, pdist_rot=None):
         np.count_nonzero(pose_clusters == best_cluster_idx),
     )
 
-    plt.hist(cluster_scores, histtype="stepfilled", bins=100)
-    plt.title("Cluster Scores Histogram")
-    plt.show()
+    # plt.hist(cluster_scores, histtype="stepfilled", bins=100)
+    # plt.title("Cluster Scores Histogram")
+    # plt.show()
 
     out_ts = defaultdict(list)
     out_Rs = defaultdict(list)
@@ -555,6 +828,3 @@ assert np.isclose(F1, 1)
 assert np.isclose(F2, F3)
 assert np.isclose(F2, np.radians(45), rtol=1e-3), f"F2={np.degrees(F2)}"
 assert np.isclose(F4, np.radians(90), rtol=1e-3)
-
-if __name__ == "__main__":
-    main()
